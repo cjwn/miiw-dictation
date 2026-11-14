@@ -1,0 +1,8 @@
+/dist/
+.DS_Store
+*.pcap*
+*.wav
+*.exe
+*.7z
+*.bin
+*.p12
