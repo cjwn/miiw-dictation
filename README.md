@@ -21,6 +21,14 @@ open dist
 
 本应用处理键盘事件、发送快捷键并控制米物麦克风启停。音频采集与语音转文字由 macOS 听写负责，是否在本机处理取决于 Apple 的系统设置及语言支持。应用自身不保存或上传录音。
 
+## Windows 版（分支，尚未在 Windows 上实测）
+
+`MIIWVoiceWin/` 是同一套思路的 Windows 实现：把语音键翻译成系统自带的「语音输入」（`Win+H`），
+替代搜狗智能助手那一整套。单文件 C#，双击 `build.bat` 用系统自带的 `csc.exe` 编译，不装 VS、
+不装 SDK、不联网、无需驱动和任何权限授权。详见 [`MIIWVoiceWin/README.md`](MIIWVoiceWin/README.md)。
+
+蓝牙 BLE 模式为什么不能替代接收器，见 [`docs/ble-notes.md`](docs/ble-notes.md)。诊断工具在 `tools/`。
+
 项目与米物、搜狗及 Apple 无隶属或背书关系。名称仅用于说明兼容设备和系统功能。
 
 ## 签名与更新
