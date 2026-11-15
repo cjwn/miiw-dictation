@@ -46,12 +46,34 @@ MIIW Voice.exe --base-url=https://xxx/v1 --api-key=tp-xxx
 
 > key 不要写进仓库。`.gitignore` 已排除 `*.env` / `*.key`。
 
-## 构建
+## 在另一台电脑上使用
 
-把 `MIIWVoiceWin` 文件夹拷到 Windows 上，**双击 `build.bat`**，会在同目录生成 `MIIW Voice.exe`。
+两种方式，任选其一。
 
-用的是 Windows 自带的 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，不需要 Visual Studio、
-不需要 .NET SDK、不需要联网。
+### 方式一：直接拷 exe（最快，不用编译）
+
+把 `MIIW Voice.exe` 拷到目标机器，**双击即可**。不需要安装任何东西、不需要管理员权限、不需要驱动。
+
+> 注意：exe 是编译产物，仓库里**没有**（`.gitignore` 排除了 `*.exe`）。
+> 所以要么从已经能用的机器上拷过去，要么用方式二编译一次。
+
+### 方式二：编译（几十秒）
+
+把 `MIIWVoiceWin` 文件夹拷到目标机器，**双击 `build.bat`**，会在同目录生成 `MIIW Voice.exe`。
+
+用的是 Windows 自带的 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`：
+Windows 10 / 11 一般自带 .NET Framework 4.x，所以**不需要 Visual Studio、不需要 .NET SDK、不需要联网**。
+如果报“找不到 csc.exe”，说明系统缺 .NET Framework 4.x，装一次即可。
+
+> 源码在 `windows-voice-key` 分支上。`git clone` 默认拿的是 `main`，里面**没有** `MIIWVoiceWin/`，
+> 需要先 `git checkout windows-voice-key`。
+
+### 首次运行：填接口配置
+
+右键托盘图标 → **设置…**，填入接口地址与密钥，点「测试连接」确认。
+配置保存在 `%LOCALAPPDATA%\MIIWVoice\settings.ini`，只需填一次。
+
+想批量部署的话也可以只拷 `settings.ini`，但它以明文保存密钥，换机器时更稳妥的做法是在设置页重新填一次。
 
 ## 使用
 
