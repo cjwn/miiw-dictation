@@ -1685,6 +1685,7 @@ namespace MiiwVoice
         private int recordStartTick;
         private volatile string lastText;
         private string iconState = "";
+        private volatile int powerEvent;
 
         public TrayApp(AppSettings settings, bool dump, bool startWithWindows)
         {
@@ -1721,14 +1722,36 @@ namespace MiiwVoice
             timer.Tick += OnTick;
             timer.Start();
 
+            Microsoft.Win32.SystemEvents.PowerModeChanged += OnPowerModeChanged;
+
             watcher.Start();
             Log.Write("启动（模式=" + (settings.AsrMode ? "应用内识别 " + MimoAsr.BaseUrl : "Win+H 快捷键") +
                       "，麦克风=" + (settings.KeyboardMic ? "键盘自带" : "系统默认") + "）");
             if (settings.AsrMode) Log.Write("录音设备: " + MicRecorder.DescribeDevices());
         }
 
+        /// <summary>
+        /// 系统休眠/唤醒。这个回调在 SystemEvents 自己的线程上，所以只置标志，
+        /// 真正的处理交给 UI 定时器，避免跨线程碰控件。
+        /// </summary>
+        private void OnPowerModeChanged(object sender, Microsoft.Win32.PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == Microsoft.Win32.PowerModes.Suspend)
+            {
+                powerEvent = 1;
+                Log.Write("系统即将休眠");
+            }
+            else if (e.Mode == Microsoft.Win32.PowerModes.Resume)
+            {
+                powerEvent = 2;
+                Log.Write("系统已从休眠恢复");
+            }
+        }
+
         private void OnTick(object sender, EventArgs e)
         {
+            HandlePowerEvent();
+
             string text = lastText;
             statusItem.Text = !watcher.Connected
                 ? "正在查找接收器…（插入米物接收器，键盘切到 2.4G 模式）"
@@ -1757,6 +1780,42 @@ namespace MiiwVoice
                 Log.Write("录音到达 60 秒上限，自动收尾上传");
                 if (longWav != null && longWav.Length > 44)
                     ThreadPool.QueueUserWorkItem(delegate { RecognizeAndType(longWav); });
+            }
+        }
+
+        private void HandlePowerEvent()
+        {
+            int evt = powerEvent;
+            if (evt == 0) return;
+            powerEvent = 0;
+
+            if (evt == 1)
+            {
+                // 音频采集流会阻止系统闲置休眠，而且 UI 定时器在休眠期间是停的，
+                // 所以必须在休眠前主动把录音停掉，否则 waveIn 会一直占着设备。
+                if (recording)
+                {
+                    recording = false;
+                    watcher.SuspendRefresh = false;
+                    try { recorder.Stop(); }
+                    catch { }
+                    Log.Write("休眠前已停止录音，该段丢弃");
+                }
+                SetIconState("idle");
+            }
+            else if (evt == 2)
+            {
+                // 唤醒后 USB 设备可能已经重新枚举，读循环会自己重连；
+                // 这里只把可能残留的录音状态清干净。
+                if (recording)
+                {
+                    recording = false;
+                    watcher.SuspendRefresh = false;
+                    try { recorder.Stop(); }
+                    catch { }
+                    Log.Write("唤醒后发现残留录音，已停止并丢弃");
+                }
+                SetIconState("idle");
             }
         }
 
@@ -1946,6 +2005,8 @@ namespace MiiwVoice
         {
             if (disposing)
             {
+                try { Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged; }
+                catch { }
                 timer.Stop();
                 timer.Dispose();
                 watcher.Dispose();
