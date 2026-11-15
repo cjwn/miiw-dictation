@@ -6,3 +6,6 @@
 *.7z
 *.bin
 *.p12
+*.env
+*.key
+*.secret

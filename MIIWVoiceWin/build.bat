@@ -15,6 +15,7 @@ if not exist "%CSC%" (
 echo 正在编译...
 "%CSC%" /nologo /target:winexe /optimize+ /platform:anycpu /warn:4 ^
     /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll ^
+    /reference:System.Web.Extensions.dll ^
     /out:"MIIW Voice.exe" MIIWVoiceWin.cs
 
 if errorlevel 1 (

@@ -21,11 +21,17 @@ open dist
 
 本应用处理键盘事件、发送快捷键并控制米物麦克风启停。音频采集与语音转文字由 macOS 听写负责，是否在本机处理取决于 Apple 的系统设置及语言支持。应用自身不保存或上传录音。
 
-## Windows 版（分支，尚未在 Windows 上实测）
+## Windows 版（已在真机实测可用）
 
-`MIIWVoiceWin/` 是同一套思路的 Windows 实现：把语音键翻译成系统自带的「语音输入」（`Win+H`），
-替代搜狗智能助手那一整套。单文件 C#，双击 `build.bat` 用系统自带的 `csc.exe` 编译，不装 VS、
-不装 SDK、不联网、无需驱动和任何权限授权。详见 [`MIIWVoiceWin/README.md`](MIIWVoiceWin/README.md)。
+`MIIWVoiceWin/` 是同一套思路的 Windows 实现：**按住语音键说话，松开约 0.5 秒后文字自动打出**。
+单文件 C#，双击 `build.bat` 用系统自带的 `csc.exe` 编译，不装 VS、不装 SDK、不联网编译、无需驱动和任何权限授权。
+
+识别默认走小米 MiMo 的 `mimo-v2.5-asr` 接口（需自备 `MIMO_BASE_URL` / `MIMO_API_KEY`）。
+这里**没有**沿用 `Win+H`，因为 Windows 10 的 `Win+H`（听写）对中文基本不可用：面板能弹出但
+一个字都不出，把清晰语音外放给系统 OneCore 引擎直接识别也返回空结果，多台机器复现。
+想用系统听写可以 `--win-h` 切回。详见 [`MIIWVoiceWin/README.md`](MIIWVoiceWin/README.md)。
+
+> 注意：应用内识别会把录音上传到所配置的接口；`--win-h` 模式则不录音。
 
 蓝牙 BLE 模式为什么不能替代接收器，见 [`docs/ble-notes.md`](docs/ble-notes.md)。诊断工具在 `tools/`。
 

@@ -10,8 +10,11 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -202,6 +205,78 @@ namespace MiiwVoice
         public const uint FileShareWrite = 0x00000002;
         public const uint OpenExisting = 3;
         public static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        // ---- winmm waveIn（录音）----
+
+        public const ushort VkReturn = 0x0D;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WaveFormatEx
+        {
+            public ushort wFormatTag;
+            public ushort nChannels;
+            public uint nSamplesPerSec;
+            public uint nAvgBytesPerSec;
+            public ushort nBlockAlign;
+            public ushort wBitsPerSample;
+            public ushort cbSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct WaveInCaps
+        {
+            public ushort wMid;
+            public ushort wPid;
+            public uint vDriverVersion;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szPname;
+            public uint dwFormats;
+            public ushort wChannels;
+            public ushort wReserved1;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WaveHdr
+        {
+            public IntPtr lpData;
+            public uint dwBufferLength;
+            public uint dwBytesRecorded;
+            public IntPtr dwUser;
+            public uint dwFlags;
+            public uint dwLoops;
+            public IntPtr lpNext;
+            public IntPtr reserved;
+        }
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInGetNumDevs();
+
+        [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+        public static extern int waveInGetDevCaps(IntPtr deviceId, ref WaveInCaps caps, int size);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInOpen(out IntPtr handle, int deviceId, ref WaveFormatEx format,
+            IntPtr callback, IntPtr instance, int flags);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInPrepareHeader(IntPtr handle, IntPtr header, int size);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInUnprepareHeader(IntPtr handle, IntPtr header, int size);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInAddBuffer(IntPtr handle, IntPtr header, int size);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInStart(IntPtr handle);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInStop(IntPtr handle);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInReset(IntPtr handle);
+
+        [DllImport("winmm.dll")]
+        public static extern int waveInClose(IntPtr handle);
     }
 
     /// <summary>发送系统快捷键（Win+H 等）。</summary>
@@ -626,6 +701,299 @@ namespace MiiwVoice
         }
     }
 
+    /// <summary>
+    /// 用 winmm 的 waveIn 录音：16 kHz / 16-bit / 单声道，不依赖任何第三方库。
+    /// 一次性分配整块缓冲区（默认最长 60 秒），松开时一次性取出。
+    /// </summary>
+    internal sealed class MicRecorder : IDisposable
+    {
+        private const int Rate = 16000;
+        private const int Channels = 1;
+        private const int Bits = 16;
+
+        private IntPtr handle = IntPtr.Zero;
+        private IntPtr headerPtr = IntPtr.Zero;
+        private IntPtr dataPtr = IntPtr.Zero;
+        private int capacity;
+        private bool open;
+
+        /// <summary>按名字片段查找录音设备序号，找不到返回 -1。</summary>
+        public static int FindDevice(string namePart)
+        {
+            int count = Native.waveInGetNumDevs();
+            int size = Marshal.SizeOf(typeof(Native.WaveInCaps));
+            for (int i = 0; i < count; i++)
+            {
+                Native.WaveInCaps caps = new Native.WaveInCaps();
+                if (Native.waveInGetDevCaps(new IntPtr(i), ref caps, size) != 0) continue;
+                if (caps.szPname != null &&
+                    caps.szPname.IndexOf(namePart, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return i;
+            }
+            return -1;
+        }
+
+        public static string DescribeDevices()
+        {
+            StringBuilder sb = new StringBuilder();
+            int count = Native.waveInGetNumDevs();
+            int size = Marshal.SizeOf(typeof(Native.WaveInCaps));
+            for (int i = 0; i < count; i++)
+            {
+                Native.WaveInCaps caps = new Native.WaveInCaps();
+                if (Native.waveInGetDevCaps(new IntPtr(i), ref caps, size) != 0) continue;
+                sb.Append(i).Append('=').Append(caps.szPname).Append("; ");
+            }
+            return sb.ToString();
+        }
+
+        public void Start(int maxSeconds, bool preferKeyboardMic)
+        {
+            Stop();   // 清掉上一次残留
+
+            capacity = Rate * (Bits / 8) * Channels * maxSeconds;
+            dataPtr = Marshal.AllocHGlobal(capacity);
+            int headerSize = Marshal.SizeOf(typeof(Native.WaveHdr));
+            headerPtr = Marshal.AllocHGlobal(headerSize);
+
+            Native.WaveFormatEx format = new Native.WaveFormatEx();
+            format.wFormatTag = 1;                 // WAVE_FORMAT_PCM
+            format.nChannels = Channels;
+            format.nSamplesPerSec = Rate;
+            format.wBitsPerSample = Bits;
+            format.nBlockAlign = (ushort)(Channels * Bits / 8);
+            format.nAvgBytesPerSec = (uint)(Rate * format.nBlockAlign);
+            format.cbSize = 0;
+
+            int deviceId = preferKeyboardMic ? FindDevice("MIIIW") : -1;
+            if (deviceId < 0) deviceId = 0;        // WAVE_MAPPER：系统默认输入
+
+            int rc = Native.waveInOpen(out handle, deviceId, ref format, IntPtr.Zero, IntPtr.Zero, 0);
+            if (rc != 0)
+            {
+                Release();
+                throw new InvalidOperationException("waveInOpen 失败，错误码 " + rc);
+            }
+
+            Native.WaveHdr header = new Native.WaveHdr();
+            header.lpData = dataPtr;
+            header.dwBufferLength = (uint)capacity;
+            Marshal.StructureToPtr(header, headerPtr, false);
+
+            Native.waveInPrepareHeader(handle, headerPtr, headerSize);
+            Native.waveInAddBuffer(handle, headerPtr, headerSize);
+            rc = Native.waveInStart(handle);
+            if (rc != 0)
+            {
+                Release();
+                throw new InvalidOperationException("waveInStart 失败，错误码 " + rc);
+            }
+            open = true;
+        }
+
+        /// <summary>停止录音并返回完整 WAV 字节（含 44 字节头）；没录到东西返回 null。</summary>
+        public byte[] Stop()
+        {
+            if (!open)
+            {
+                Release();
+                return null;
+            }
+            open = false;
+
+            int headerSize = Marshal.SizeOf(typeof(Native.WaveHdr));
+            Native.waveInStop(handle);
+            Native.WaveHdr header = (Native.WaveHdr)Marshal.PtrToStructure(headerPtr, typeof(Native.WaveHdr));
+            int recorded = (int)header.dwBytesRecorded;
+            Native.waveInReset(handle);
+            Native.waveInUnprepareHeader(handle, headerPtr, headerSize);
+            Native.waveInClose(handle);
+            handle = IntPtr.Zero;
+
+            if (recorded < 0 || recorded > capacity) recorded = 0;
+            byte[] pcm = new byte[recorded];
+            if (recorded > 0) Marshal.Copy(dataPtr, pcm, 0, recorded);
+            Release();
+
+            return recorded == 0 ? null : BuildWav(pcm);
+        }
+
+        private void Release()
+        {
+            if (handle != IntPtr.Zero) { Native.waveInClose(handle); handle = IntPtr.Zero; }
+            if (headerPtr != IntPtr.Zero) { Marshal.FreeHGlobal(headerPtr); headerPtr = IntPtr.Zero; }
+            if (dataPtr != IntPtr.Zero) { Marshal.FreeHGlobal(dataPtr); dataPtr = IntPtr.Zero; }
+        }
+
+        public void Dispose()
+        {
+            Stop();
+        }
+
+        private static byte[] BuildWav(byte[] pcm)
+        {
+            byte[] wav = new byte[44 + pcm.Length];
+            using (MemoryStream stream = new MemoryStream(wav))
+            using (BinaryWriter writer = new BinaryWriter(stream))
+            {
+                int blockAlign = Channels * Bits / 8;
+                writer.Write(Encoding.ASCII.GetBytes("RIFF"));
+                writer.Write(36 + pcm.Length);
+                writer.Write(Encoding.ASCII.GetBytes("WAVE"));
+                writer.Write(Encoding.ASCII.GetBytes("fmt "));
+                writer.Write(16);
+                writer.Write((short)1);
+                writer.Write((short)Channels);
+                writer.Write(Rate);
+                writer.Write(Rate * blockAlign);
+                writer.Write((short)blockAlign);
+                writer.Write((short)Bits);
+                writer.Write(Encoding.ASCII.GetBytes("data"));
+                writer.Write(pcm.Length);
+                writer.Write(pcm);
+            }
+            return wav;
+        }
+    }
+
+    /// <summary>
+    /// 小米 MiMo 的 ASR（mimo-v2.5-asr）。走 OpenAI 风格的 chat/completions，
+    /// 消息里只能有一个 input_audio part，不能带任何 text part（网关自己注入提示词）。
+    /// </summary>
+    internal static class MimoAsr
+    {
+        public static string BaseUrl = "";
+        public static string ApiKey = "";
+
+        public static bool Ready
+        {
+            get { return BaseUrl.Length > 0 && ApiKey.Length > 0; }
+        }
+
+        /// <summary>先读进程环境变量，读不到就回落到注册表里的用户环境变量（setx 写的就是那里）。</summary>
+        public static string ReadSetting(string name)
+        {
+            string value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(value)) return value;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey("Environment"))
+                {
+                    if (key != null)
+                    {
+                        object stored = key.GetValue(name);
+                        if (stored != null) return stored.ToString();
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>成功返回文字（可能为空字符串），失败返回 null。</summary>
+        public static string Transcribe(byte[] wav)
+        {
+            string json = "{\"model\":\"mimo-v2.5-asr\",\"messages\":[{\"role\":\"user\",\"content\":[" +
+                          "{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"" +
+                          Convert.ToBase64String(wav) + "\",\"format\":\"wav\"}}]}]}";
+            try
+            {
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(BaseUrl + "/chat/completions");
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.Headers["Authorization"] = "Bearer " + ApiKey;
+                request.Timeout = 60000;
+                request.ReadWriteTimeout = 60000;
+                request.KeepAlive = false;
+
+                byte[] payload = Encoding.UTF8.GetBytes(json);
+                using (Stream body = request.GetRequestStream())
+                    body.Write(payload, 0, payload.Length);
+
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    return ParseContent(reader.ReadToEnd());
+            }
+            catch (WebException ex)
+            {
+                string detail = "";
+                try
+                {
+                    if (ex.Response != null)
+                        using (StreamReader reader = new StreamReader(ex.Response.GetResponseStream(), Encoding.UTF8))
+                            detail = reader.ReadToEnd();
+                }
+                catch { }
+                Log.Write("ASR 请求失败: " + ex.Message + " " + TextUtil.Trim(detail, 300));
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("ASR 异常: " + ex.GetType().Name + " " + ex.Message);
+                return null;
+            }
+        }
+
+        private static string ParseContent(string body)
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            Dictionary<string, object> root = serializer.DeserializeObject(body) as Dictionary<string, object>;
+            if (root == null || !root.ContainsKey("choices")) return null;
+            object[] choices = root["choices"] as object[];
+            if (choices == null || choices.Length == 0) return null;
+            Dictionary<string, object> first = choices[0] as Dictionary<string, object>;
+            if (first == null) return null;
+            Dictionary<string, object> message = first["message"] as Dictionary<string, object>;
+            if (message == null) return null;
+            object content = message.ContainsKey("content") ? message["content"] : null;
+            return content == null ? "" : content.ToString().Trim();
+        }
+    }
+
+    /// <summary>把文字用 SendInput 打出去。中文依靠 KEYEVENTF_UNICODE，不受键盘布局影响。</summary>
+    internal static class Typer
+    {
+        private const uint KeyEventUnicode = 0x0004;
+        private const uint KeyEventKeyUp = 0x0002;
+
+        public static void TypeText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            foreach (char c in text)
+            {
+                if (c == '\r') continue;
+                if (c == '\n')
+                {
+                    Send(Native.VkReturn, (char)0, 0);
+                    Send(Native.VkReturn, (char)0, KeyEventKeyUp);
+                    continue;
+                }
+                Send(0, c, KeyEventUnicode);
+                Send(0, c, KeyEventUnicode | KeyEventKeyUp);
+            }
+        }
+
+        private static void Send(ushort virtualKey, char scanCode, uint flags)
+        {
+            Native.Input input = new Native.Input();
+            input.type = Native.InputKeyboard;
+            input.u.ki.wVk = virtualKey;
+            input.u.ki.wScan = scanCode;
+            input.u.ki.dwFlags = flags;
+            Native.SendInput(1, new[] { input }, Marshal.SizeOf(typeof(Native.Input)));
+        }
+    }
+
+    internal static class TextUtil
+    {
+        public static string Trim(string text, int max)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            text = text.Replace('\r', ' ').Replace('\n', ' ');
+            return text.Length <= max ? text : text.Substring(0, max) + "…";
+        }
+    }
+
     internal sealed class TrayApp : ApplicationContext
     {
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -636,10 +1004,17 @@ namespace MiiwVoice
         private readonly ToolStripMenuItem startupItem;
         private readonly HidWatcher watcher;
         private readonly System.Windows.Forms.Timer timer;
+        private readonly MicRecorder recorder = new MicRecorder();
+        private readonly bool asrMode;
+        private readonly bool preferKeyboardMic;
         private bool dictationOn;
+        private bool recording;
+        private volatile string lastText;
 
-        public TrayApp(bool keyboardMic, bool dump, bool startWithWindows)
+        public TrayApp(bool keyboardMic, bool dump, bool startWithWindows, bool asrMode)
         {
+            this.asrMode = asrMode;
+            preferKeyboardMic = keyboardMic;
             watcher = new HidWatcher(keyboardMic, dump);
 
             statusItem = new ToolStripMenuItem("正在查找接收器…");
@@ -672,30 +1047,122 @@ namespace MiiwVoice
             timer.Start();
 
             watcher.Start();
-            Log.Write("启动（麦克风=" + (keyboardMic ? "键盘自带" : "系统默认") + "，松手=" +
-                      (KeySender.StopByToggle ? "再按 Win+H" : "Esc") + "）");
+            Log.Write("启动（模式=" + (asrMode ? "应用内识别 " + MimoAsr.BaseUrl : "Win+H 快捷键") +
+                      "，麦克风=" + (keyboardMic ? "键盘自带" : "系统默认") + "）");
+            if (asrMode) Log.Write("录音设备: " + MicRecorder.DescribeDevices());
         }
 
         private void OnTick(object sender, EventArgs e)
         {
-            statusItem.Text = watcher.Connected
-                ? "语音键已就绪：按一下开始 / 再按一下结束"
-                : "正在查找接收器…（插入米物接收器，键盘切到 2.4G 模式）";
+            string text = lastText;
+            statusItem.Text = !watcher.Connected
+                ? "正在查找接收器…（插入米物接收器，键盘切到 2.4G 模式）"
+                : (text != null
+                    ? "上次识别：" + TextUtil.Trim(text, 40)
+                    : ReadyHint());
 
             bool down;
             while (watcher.TryDequeue(out down))
             {
-                if (down)
-                {
-                    KeySender.StartVoiceTyping();
-                    dictationOn = true;
-                }
-                else
-                {
-                    if (dictationOn) KeySender.StopVoiceTyping();
-                    dictationOn = false;
-                }
+                if (asrMode) HandleAsr(down);
+                else HandleHotkey(down);
             }
+        }
+
+        private string ReadyHint()
+        {
+            if (recording) return "录音中…松开结束";
+            return asrMode ? "语音键已就绪：按住说话，松开出字" : "语音键已就绪：按一下开始 / 再按一下结束";
+        }
+
+        /// <summary>旧模式：把语音键翻译成 Win+H。</summary>
+        private void HandleHotkey(bool down)
+        {
+            if (down)
+            {
+                KeySender.StartVoiceTyping();
+                dictationOn = true;
+            }
+            else
+            {
+                if (dictationOn) KeySender.StopVoiceTyping();
+                dictationOn = false;
+            }
+        }
+
+        /// <summary>按住录音，松开后上传识别并打出文字。</summary>
+        private void HandleAsr(bool down)
+        {
+            if (down)
+            {
+                try
+                {
+                    recorder.Start(60, preferKeyboardMic);
+                    recording = true;
+                    Log.Write("开始录音");
+                }
+                catch (Exception ex)
+                {
+                    recording = false;
+                    Log.Write("录音启动失败: " + ex.Message);
+                }
+                return;
+            }
+
+            if (!recording) return;
+            recording = false;
+
+            byte[] wav;
+            try { wav = recorder.Stop(); }
+            catch (Exception ex) { Log.Write("录音停止失败: " + ex.Message); return; }
+
+            if (wav == null || wav.Length <= 44)
+            {
+                Log.Write("没录到音频");
+                return;
+            }
+
+            int milliseconds = (wav.Length - 44) / 32;   // 16000 Hz * 2 字节 = 32 字节/毫秒
+            int loud = CountLoudBytes(wav);
+            Log.Write("录音 " + milliseconds + " ms，非零字节 " + loud);
+            if (milliseconds < 200)
+            {
+                Log.Write("录音太短，忽略");
+                return;
+            }
+            if (loud < (wav.Length - 44) / 200)
+            {
+                Log.Write("录音几乎全零，键盘可能处于休眠；请先按一下键盘再试");
+                return;
+            }
+
+            ThreadPool.QueueUserWorkItem(delegate { RecognizeAndType(wav); });
+        }
+
+        private void RecognizeAndType(byte[] wav)
+        {
+            string text = MimoAsr.Transcribe(wav);
+            if (text == null)
+            {
+                lastText = "（识别请求失败，见日志）";
+                return;
+            }
+            if (text.Length == 0)
+            {
+                Log.Write("识别结果为空");
+                lastText = "（没听清）";
+                return;
+            }
+            Log.Write("识别: " + text);
+            lastText = text;
+            Typer.TypeText(text);
+        }
+
+        private static int CountLoudBytes(byte[] wav)
+        {
+            int count = 0;
+            for (int i = 44; i < wav.Length; i++) if (wav[i] != 0) count++;
+            return count;
         }
 
         private void OnToggleStartup(object sender, EventArgs e)
@@ -788,17 +1255,35 @@ namespace MiiwVoice
             bool keyboardMic = false;
             bool dump = false;
             bool startWithWindows = false;
+            bool asrMode = true;
+            bool systemMic = false;
+            string baseUrl = null;
+            string apiKey = null;
 
             foreach (string arg in args)
             {
                 string a = arg.ToLowerInvariant();
                 if (a == "--keyboard-mic") keyboardMic = true;                // 使用键盘自带麦克风
+                else if (a == "--system-mic") systemMic = true;               // 用系统默认麦克风
                 else if (a == "--dump") dump = true;                          // 记录所有原始报告
                 else if (a == "--no-toggle") KeySender.StopByToggle = false;   // 松手发 Esc
                 else if (a == "--slow") KeySender.SlowCombo = true;            // 分步发送
                 else if (a == "--no-input") KeySender.Enabled = false;         // 只记日志，不注入按键
                 else if (a == "--autostart") startWithWindows = true;
+                else if (a == "--win-h") asrMode = false;                     // 退回 Win+H 模式
+                else if (a == "--asr") asrMode = true;                        // 应用内识别（默认）
+                else if (a.StartsWith("--base-url=")) baseUrl = arg.Substring(11);
+                else if (a.StartsWith("--api-key=")) apiKey = arg.Substring(10);
             }
+
+            MimoAsr.BaseUrl = baseUrl ?? MimoAsr.ReadSetting("MIMO_BASE_URL");
+            MimoAsr.ApiKey = apiKey ?? MimoAsr.ReadSetting("MIMO_API_KEY");
+            if (MimoAsr.BaseUrl.Length > 0) MimoAsr.BaseUrl = MimoAsr.BaseUrl.TrimEnd('/');
+            try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; }
+            catch { }
+
+            // 应用内识别必须用键盘自带麦克风（否则语音键和麦克风对不上）且必须配置好接口。
+            if (asrMode && !systemMic) keyboardMic = true;
 
             bool created;
             using (Mutex mutex = new Mutex(true, @"Local\MIIWVoice.SingleInstance", out created))
@@ -819,8 +1304,16 @@ namespace MiiwVoice
                 {
                     Log.Write("未处理异常: " + e.ExceptionObject);
                 };
-                Log.Write("==== 启动 ====");
-                Application.Run(new TrayApp(keyboardMic, dump, startWithWindows));
+                Log.Write("==== 启动 ====" +
+                    (asrMode
+                        ? "  模式=应用内识别（mimo-v2.5-asr），麦克风=" + (keyboardMic ? "键盘自带" : "系统默认")
+                        : "  模式=Win+H 快捷键"));
+                if (asrMode && !MimoAsr.Ready)
+                {
+                    Log.Write("未配置 MIMO_BASE_URL / MIMO_API_KEY，退回 Win+H 模式");
+                    asrMode = false;
+                }
+                Application.Run(new TrayApp(keyboardMic, dump, startWithWindows, asrMode));
             }
         }
     }
