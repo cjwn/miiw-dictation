@@ -204,6 +204,18 @@ namespace MiiwVoice
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CancelIoEx(IntPtr file, IntPtr overlapped);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool ShowWindow(IntPtr window, int command);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter,
+            int x, int y, int width, int height, uint flags);
+
+        public const int SwShowNoActivate = 4;
+        public const int SwHide = 0;
+        public static readonly IntPtr HwndTopmost = new IntPtr(-1);
+        public const uint SwpNoActivate = 0x0010;
+
         public const uint FileShareRead = 0x00000001;
         public const uint FileShareWrite = 0x00000002;
         public const uint OpenExisting = 3;
@@ -386,7 +398,7 @@ namespace MiiwVoice
         /// 语音键报告，而 ReadFile 是阻塞的、不会返回错误。实测重发一次初始化握手即可恢复，
         /// 所以定期刷新就够，不需要重连或拔插接收器。
         /// </summary>
-        private const int RefreshIntervalMs = 15000;
+        private const int RefreshIntervalMs = 60000;
 
         private readonly object writeGate = new object();
 
@@ -553,6 +565,20 @@ namespace MiiwVoice
                 if (dump) Log.Write("report " + Hex(buffer, read));
 
                 // 报告形如 01 B0 <state> ...：01 是 Report ID，B0 是语音键通道。
+                // 接收器的链路事件：键盘断开/重连时各来一条（实测每个循环恰好一条）。
+                // 借它把状态机复位，避免按住期间断电导致松开报告丢失、状态永久卡在“按住”。
+                if (buffer[0] == 0x01 && buffer[1] == 0xE3)
+                {
+                    Log.Write("收到链路事件 0xE3（键盘断开/重连），值=" + buffer[2]);
+                    if (buttonHeld)
+                    {
+                        buttonHeld = false;
+                        Log.Write("链路事件：收尾上一轮录音");
+                        Enqueue(false);
+                    }
+                    continue;
+                }
+
                 if (buffer[0] != 0x01 || buffer[1] != 0xB0)
                 {
                     // 非语音键报告平时不写日志；不属于已知命令的记一条，便于发现
@@ -565,7 +591,16 @@ namespace MiiwVoice
                 byte state = buffer[2];
                 if (state != 0)
                 {
-                    if (buttonHeld) continue;      // B0 03 是按住时的重复帧
+                    if (buttonHeld)
+                    {
+                        if (state != 0x01) continue;   // B0 03 是按住时的重复帧
+                        // 又收到一次 B0 01：说明上一轮的松开报告丢了
+                        //（最常见的就是按着语音键把键盘关掉）。先把上一轮收尾，
+                        // 否则状态机会永久停在“按住”，之后所有按键都被吞掉。
+                        Log.Write("上一轮松开报告缺失，自动收尾后重新开始");
+                        Enqueue(false);
+                        buttonHeld = false;
+                    }
                     buttonHeld = true;
                     Log.Write("语音键按下 (state=" + state + ")");
                     if (keyboardMic)
@@ -594,7 +629,7 @@ namespace MiiwVoice
         private static bool IsKnownReport(byte command)
         {
             return command == 0xB0 || command == 0xB1 || command == 0xB2 ||
-                   command == 0xD1 || command == 0xE1 || command == 0xE2;
+                   command == 0xD1 || command == 0xE1 || command == 0xE2 || command == 0xE3;
         }
 
         /// <summary>
@@ -1092,6 +1127,546 @@ namespace MiiwVoice
         }
     }
 
+    /// <summary>程序设置，保存在 %LOCALAPPDATA%\MIIWVoice\settings.ini。</summary>
+    internal sealed class AppSettings
+    {
+        public bool AsrMode = true;
+        public bool KeyboardMic = true;
+        public string BaseUrl = "";
+        public string ApiKey = "";
+        public bool TrayColor = true;
+        public bool ShowOverlay = true;
+        public bool Sound = false;
+        public int OverlaySeconds = 2;
+
+        public static string Directory
+        {
+            get
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MIIWVoice");
+                try { System.IO.Directory.CreateDirectory(dir); }
+                catch { }
+                return dir;
+            }
+        }
+
+        public static string FilePath
+        {
+            get { return Path.Combine(Directory, "settings.ini"); }
+        }
+
+        public static AppSettings Load()
+        {
+            AppSettings s = new AppSettings();
+            try
+            {
+                if (!File.Exists(FilePath)) return s;
+                foreach (string raw in File.ReadAllLines(FilePath, Encoding.UTF8))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string key = line.Substring(0, eq).Trim();
+                    string value = line.Substring(eq + 1).Trim();
+                    if (key == "AsrMode") s.AsrMode = value != "0";
+                    else if (key == "KeyboardMic") s.KeyboardMic = value != "0";
+                    else if (key == "BaseUrl") s.BaseUrl = value;
+                    else if (key == "ApiKey") s.ApiKey = value;
+                    else if (key == "TrayColor") s.TrayColor = value != "0";
+                    else if (key == "ShowOverlay") s.ShowOverlay = value != "0";
+                    else if (key == "Sound") s.Sound = value != "0";
+                    else if (key == "OverlaySeconds")
+                    {
+                        int n;
+                        if (int.TryParse(value, out n) && n >= 1 && n <= 20) s.OverlaySeconds = n;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write("读取设置失败: " + ex.Message);
+            }
+            return s;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("# 米物语音键设置");
+                sb.AppendLine("AsrMode=" + (AsrMode ? "1" : "0"));
+                sb.AppendLine("KeyboardMic=" + (KeyboardMic ? "1" : "0"));
+                sb.AppendLine("BaseUrl=" + BaseUrl);
+                sb.AppendLine("ApiKey=" + ApiKey);
+                sb.AppendLine("TrayColor=" + (TrayColor ? "1" : "0"));
+                sb.AppendLine("ShowOverlay=" + (ShowOverlay ? "1" : "0"));
+                sb.AppendLine("Sound=" + (Sound ? "1" : "0"));
+                sb.AppendLine("OverlaySeconds=" + OverlaySeconds);
+                File.WriteAllText(FilePath, sb.ToString(), Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Log.Write("保存设置失败: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>托盘图标。用颜色区分状态，比弹通知安静得多。</summary>
+    internal static class TrayIcons
+    {
+        private static readonly Dictionary<string, Icon> Cache = new Dictionary<string, Icon>();
+
+        public static Icon Get(Color color, string key)
+        {
+            Icon cached;
+            if (Cache.TryGetValue(key, out cached)) return cached;
+
+            Icon made;
+            try
+            {
+                Bitmap bitmap = new Bitmap(16, 16);
+                using (Graphics g = Graphics.FromImage(bitmap))
+                {
+                    g.Clear(Color.Transparent);
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    using (SolidBrush body = new SolidBrush(color))
+                    using (Pen line = new Pen(color, 1.6f))
+                    {
+                        g.FillEllipse(body, 5, 2, 6, 7);
+                        g.DrawArc(line, 3, 4, 10, 8, 0, 180);
+                        g.DrawLine(line, 8, 12, 8, 14);
+                    }
+                }
+                made = Icon.FromHandle(bitmap.GetHicon());
+            }
+            catch
+            {
+                made = SystemIcons.Application;
+            }
+            Cache[key] = made;
+            return made;
+        }
+    }
+
+    /// <summary>
+    /// 屏幕底部的状态浮条。不抢焦点（WS_EX_NOACTIVATE）、不进任务栏、不用系统通知，
+    /// 所以不会把文字打到它自己身上，也不会打扰其他操作。
+    /// </summary>
+    internal sealed class Overlay : Form
+    {
+        private readonly Label label = new Label();
+        private readonly System.Windows.Forms.Timer hideTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer durationTimer = new System.Windows.Forms.Timer();
+        private string prefix = "";
+        private int startedTick;
+
+        public Overlay()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(34, 34, 36);
+            Opacity = 0.94;
+            AutoScaleMode = AutoScaleMode.None;
+            Width = 280;
+            Height = 38;
+
+            label.Dock = DockStyle.Fill;
+            label.TextAlign = ContentAlignment.MiddleCenter;
+            label.ForeColor = Color.White;
+            label.Font = new Font("Microsoft YaHei UI", 9.5f);
+            label.BackColor = Color.Transparent;
+            Controls.Add(label);
+
+            // 在构造（UI）线程上把句柄建出来，之后 BeginInvoke 才能定位到正确线程。
+            IntPtr forceHandle = Handle;
+            if (forceHandle == IntPtr.Zero) { }
+
+            hideTimer.Interval = 1000;
+            hideTimer.Tick += delegate { hideTimer.Stop(); HideOverlay(); };
+
+            durationTimer.Interval = 250;
+            durationTimer.Tick += delegate
+            {
+                int seconds = unchecked(Environment.TickCount - startedTick) / 1000;
+                label.Text = prefix + "  " + seconds + "s";
+            };
+        }
+
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000;   // WS_EX_NOACTIVATE
+                cp.ExStyle |= 0x00000080;   // WS_EX_TOOLWINDOW
+                return cp;
+            }
+        }
+
+        /// <summary>
+        /// 所有对浮条的读写都必须回到 UI 线程。识别是在线程池线程上完成的，
+        /// 直接在那里改控件或启停定时器有两个后果：跨线程访问控件不安全；
+        /// 更致命的是 System.Windows.Forms.Timer 会把隐藏窗口建在没有消息循环的线程上，
+        /// Tick 永远不触发（表现为浮条不自动消失）。
+        /// </summary>
+        private void Ui(Action action)
+        {
+            try
+            {
+                if (IsHandleCreated && InvokeRequired)
+                {
+                    BeginInvoke(action);
+                    return;
+                }
+            }
+            catch { }
+            action();
+        }
+
+        private bool shown;
+
+        private void HideOverlay()
+        {
+            if (!shown) return;
+            shown = false;
+            try { Native.ShowWindow(Handle, Native.SwHide); }
+            catch { }
+        }
+
+        private void Present(string text, Color color)
+        {
+            hideTimer.Stop();
+            durationTimer.Stop();
+            prefix = text;
+            label.ForeColor = color;
+            label.Text = text;
+            try
+            {
+                Rectangle work = Screen.PrimaryScreen.WorkingArea;
+                int x = work.Left + (work.Width - Width) / 2;
+                int y = work.Bottom - Height - 96;
+                IntPtr hwnd = Handle;                       // 强制创建窗口句柄
+                if (!shown)
+                {
+                    // 用 SW_SHOWNOACTIVATE 而非常规 Show()，确保永远不会抢走焦点。
+                    Native.ShowWindow(hwnd, Native.SwShowNoActivate);
+                    shown = true;
+                }
+                Native.SetWindowPos(hwnd, Native.HwndTopmost, x, y, Width, Height, Native.SwpNoActivate);
+            }
+            catch { }
+        }
+
+        public void Recording()
+        {
+            Ui(delegate
+            {
+                startedTick = Environment.TickCount;
+                Present("● 录音中", Color.FromArgb(255, 118, 118));
+                durationTimer.Start();
+            });
+        }
+
+        public void Busy(string what)
+        {
+            Ui(delegate { Present("◎ " + what, Color.FromArgb(255, 200, 90)); });
+        }
+
+        /// <summary>
+        /// 识别完成。文字已经打出来了，这本身就是最好的反馈，所以浮条立刻消失，
+        /// 不再多显示一个“完成”，尽量减少对用户的干扰。
+        /// </summary>
+        public void Done()
+        {
+            Ui(delegate { HideOverlay(); });
+        }
+
+        public void Problem(string text, int seconds)
+        {
+            int hold = seconds < 1 ? 1 : seconds;
+            Ui(delegate
+            {
+                Present("! " + TextUtil.Trim(text, 28), Color.FromArgb(255, 160, 120));
+                hideTimer.Interval = hold * 1000;
+                hideTimer.Start();
+            });
+        }
+    }
+
+    /// <summary>提示音。用极短的两声哔，不用系统通知声。</summary>
+    internal static class Cue
+    {
+        public static void On(bool enabled, int frequency, int milliseconds)
+        {
+            if (!enabled) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { Console.Beep(frequency, milliseconds); }
+                catch { }
+            });
+        }
+    }
+
+    /// <summary>设置页。改完保存后，提示方式与接口配置立即生效，识别方式/麦克风需重启。</summary>
+    internal sealed class SettingsForm : Form
+    {
+        private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string RunValue = "MIIWVoice";
+
+        private readonly AppSettings settings;
+        private readonly RadioButton asrRadio = new RadioButton();
+        private readonly RadioButton winhRadio = new RadioButton();
+        private readonly RadioButton kbRadio = new RadioButton();
+        private readonly RadioButton sysRadio = new RadioButton();
+        private readonly TextBox baseBox = new TextBox();
+        private readonly TextBox keyBox = new TextBox();
+        private readonly CheckBox trayCheck = new CheckBox();
+        private readonly CheckBox overlayCheck = new CheckBox();
+        private readonly CheckBox soundCheck = new CheckBox();
+        private readonly NumericUpDown secondBox = new NumericUpDown();
+        private readonly CheckBox autoCheck = new CheckBox();
+
+        public SettingsForm(AppSettings settings)
+        {
+            this.settings = settings;
+
+            Text = "米物语音键 · 设置";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ClientSize = new Size(496, 520);
+            AutoScaleMode = AutoScaleMode.None;
+            Font = new Font("Microsoft YaHei UI", 9f);
+
+            int y = 12;
+            AddLabel("识别方式", 16, y, true);
+            y += 22;
+            SetupRadio(asrRadio, "应用内识别（MiMo ASR，推荐）", 24, y, true);
+            y += 22;
+            SetupRadio(winhRadio, "Win+H 快捷键（Windows 10 中文通常出不来字）", 24, y, false);
+            y += 30;
+
+            AddLabel("麦克风", 16, y, true);
+            y += 22;
+            SetupRadio(kbRadio, "键盘自带麦克风（需 2.4G 接收器）", 24, y, true);
+            y += 22;
+            SetupRadio(sysRadio, "系统默认麦克风", 24, y, false);
+            y += 30;
+
+            AddLabel("接口地址", 16, y, false);
+            y += 20;
+            baseBox.SetBounds(24, y, 420, 24);
+            baseBox.Text = settings.BaseUrl;
+            Controls.Add(baseBox);
+            y += 32;
+
+            AddLabel("接口密钥", 16, y, false);
+            y += 20;
+            keyBox.SetBounds(24, y, 300, 24);
+            keyBox.UseSystemPasswordChar = true;
+            keyBox.Text = settings.ApiKey;
+            Controls.Add(keyBox);
+            Button testButton = new Button();
+            testButton.Text = "测试连接";
+            testButton.SetBounds(334, y - 1, 110, 26);
+            testButton.Click += OnTestConnection;
+            Controls.Add(testButton);
+            y += 34;
+
+            AddLabel("按键提示（不弹系统通知）", 16, y, true);
+            y += 24;
+            SetupCheck(trayCheck, "托盘图标变色", 24, y, settings.TrayColor);
+            SetupCheck(overlayCheck, "屏幕底部浮条", 24, y + 24, settings.ShowOverlay);
+            SetupCheck(soundCheck, "两声短提示音", 24, y + 48, settings.Sound);
+
+            Label secondLabel = new Label();
+            secondLabel.Text = "浮条停留";
+            secondLabel.SetBounds(258, y + 8, 66, 20);
+            Controls.Add(secondLabel);
+            secondBox.SetBounds(330, y + 5, 58, 24);
+            secondBox.Minimum = 1;
+            secondBox.Maximum = 20;
+            secondBox.Value = settings.OverlaySeconds;
+            Controls.Add(secondBox);
+            Label unit = new Label();
+            unit.Text = "秒";
+            unit.SetBounds(394, y + 8, 24, 20);
+            Controls.Add(unit);
+            y += 82;
+
+            SetupCheck(autoCheck, "开机自动运行", 24, y, IsStartupEnabled());
+            y += 32;
+
+            Label hint = new Label();
+            hint.Text = "识别方式 / 麦克风 改动需要退出重开程序生效；其余立即生效。";
+            hint.ForeColor = Color.Gray;
+            hint.SetBounds(24, y, 420, 20);
+            Controls.Add(hint);
+            y += 28;
+
+            Button logButton = new Button();
+            logButton.Text = "打开日志";
+            logButton.SetBounds(24, y, 96, 30);
+            logButton.Click += delegate { OpenLog(); };
+            Controls.Add(logButton);
+
+            Button cancelButton = new Button();
+            cancelButton.Text = "取消";
+            cancelButton.SetBounds(252, y, 88, 30);
+            cancelButton.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancelButton);
+
+            Button saveButton = new Button();
+            saveButton.Text = "保存";
+            saveButton.SetBounds(350, y, 94, 30);
+            saveButton.Click += OnSave;
+            Controls.Add(saveButton);
+
+            asrRadio.Checked = settings.AsrMode;
+            winhRadio.Checked = !settings.AsrMode;
+            kbRadio.Checked = settings.KeyboardMic;
+            sysRadio.Checked = !settings.KeyboardMic;
+            AcceptButton = saveButton;
+            CancelButton = cancelButton;
+        }
+
+        private void AddLabel(string text, int x, int y, bool bold)
+        {
+            Label label = new Label();
+            label.Text = text;
+            label.SetBounds(x, y, 420, 20);
+            if (bold) label.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
+            Controls.Add(label);
+        }
+
+        private void SetupRadio(RadioButton radio, string text, int x, int y, bool first)
+        {
+            radio.Text = text;
+            radio.SetBounds(x, y, 420, 22);
+            radio.Checked = first;
+            Controls.Add(radio);
+        }
+
+        private void SetupCheck(CheckBox box, string text, int x, int y, bool value)
+        {
+            box.Text = text;
+            box.SetBounds(x, y, 420, 22);
+            box.Checked = value;
+            Controls.Add(box);
+        }
+
+        private void OnTestConnection(object sender, EventArgs e)
+        {
+            string url = (baseBox.Text ?? "").Trim().TrimEnd('/');
+            string key = (keyBox.Text ?? "").Trim();
+            if (url.Length == 0 || key.Length == 0)
+            {
+                MessageBox.Show(this, "先填接口地址和密钥。", "测试连接",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url + "/models");
+                request.Method = "GET";
+                request.Headers["Authorization"] = "Bearer " + key;
+                request.Timeout = 15000;
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                {
+                    string body = reader.ReadToEnd();
+                    bool hasAsr = body.IndexOf("mimo-v2.5-asr", StringComparison.OrdinalIgnoreCase) >= 0;
+                    MessageBox.Show(this,
+                        hasAsr ? "连接成功，接口里有 mimo-v2.5-asr。"
+                               : "连接成功，但没在模型列表里看到 mimo-v2.5-asr：\n" + TextUtil.Trim(body, 200),
+                        "测试连接", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "连接失败：" + ex.Message, "测试连接",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+        }
+
+        private void OnSave(object sender, EventArgs e)
+        {
+            string url = (baseBox.Text ?? "").Trim().TrimEnd('/');
+            string key = (keyBox.Text ?? "").Trim();
+            if (asrRadio.Checked && (url.Length == 0 || key.Length == 0))
+            {
+                MessageBox.Show(this, "选了应用内识别，就必须填接口地址和密钥。", "保存",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            settings.AsrMode = asrRadio.Checked;
+            settings.KeyboardMic = kbRadio.Checked;
+            settings.BaseUrl = url;
+            settings.ApiKey = key;
+            settings.TrayColor = trayCheck.Checked;
+            settings.ShowOverlay = overlayCheck.Checked;
+            settings.Sound = soundCheck.Checked;
+            settings.OverlaySeconds = (int)secondBox.Value;
+            settings.Save();
+
+            MimoAsr.BaseUrl = url;
+            MimoAsr.ApiKey = key;
+            SetStartup(autoCheck.Checked);
+
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        private static bool IsStartupEnabled()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey))
+            {
+                if (key == null) return false;
+                return key.GetValue(RunValue) != null;
+            }
+        }
+
+        private static void SetStartup(bool enabled)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKey))
+                {
+                    if (key == null) return;
+                    if (enabled) key.SetValue(RunValue, "\"" + Application.ExecutablePath + "\"");
+                    else key.DeleteValue(RunValue, false);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write("设置开机启动失败: " + ex.Message);
+            }
+        }
+
+        private static void OpenLog()
+        {
+            try { System.Diagnostics.Process.Start("notepad.exe", Log.Path); }
+            catch (Exception ex) { Log.Write("打开日志失败: " + ex.Message); }
+        }
+    }
+
     internal sealed class TrayApp : ApplicationContext
     {
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -1103,18 +1678,18 @@ namespace MiiwVoice
         private readonly HidWatcher watcher;
         private readonly System.Windows.Forms.Timer timer;
         private readonly MicRecorder recorder = new MicRecorder();
-        private readonly bool asrMode;
-        private readonly bool preferKeyboardMic;
+        private readonly AppSettings settings;
+        private readonly Overlay overlay = new Overlay();
         private bool dictationOn;
         private bool recording;
         private int recordStartTick;
         private volatile string lastText;
+        private string iconState = "";
 
-        public TrayApp(bool keyboardMic, bool dump, bool startWithWindows, bool asrMode)
+        public TrayApp(AppSettings settings, bool dump, bool startWithWindows)
         {
-            this.asrMode = asrMode;
-            preferKeyboardMic = keyboardMic;
-            watcher = new HidWatcher(keyboardMic, dump);
+            this.settings = settings;
+            watcher = new HidWatcher(settings.KeyboardMic, dump);
 
             statusItem = new ToolStripMenuItem("正在查找接收器…");
             statusItem.Enabled = false;
@@ -1129,12 +1704,13 @@ namespace MiiwVoice
             menu.Items.Add(statusItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(startupItem);
+            menu.Items.Add(new ToolStripMenuItem("设置…", null, OnOpenSettings));
             menu.Items.Add(new ToolStripMenuItem("打开日志", null, OnOpenLog));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("退出", null, OnExit));
 
             icon = new NotifyIcon();
-            icon.Icon = CreateIcon();
+            icon.Icon = TrayIcons.Get(Color.FromArgb(70, 165, 255), "idle");
             icon.Text = "米物语音键";
             icon.ContextMenuStrip = menu;
             icon.Visible = true;
@@ -1146,9 +1722,9 @@ namespace MiiwVoice
             timer.Start();
 
             watcher.Start();
-            Log.Write("启动（模式=" + (asrMode ? "应用内识别 " + MimoAsr.BaseUrl : "Win+H 快捷键") +
-                      "，麦克风=" + (keyboardMic ? "键盘自带" : "系统默认") + "）");
-            if (asrMode) Log.Write("录音设备: " + MicRecorder.DescribeDevices());
+            Log.Write("启动（模式=" + (settings.AsrMode ? "应用内识别 " + MimoAsr.BaseUrl : "Win+H 快捷键") +
+                      "，麦克风=" + (settings.KeyboardMic ? "键盘自带" : "系统默认") + "）");
+            if (settings.AsrMode) Log.Write("录音设备: " + MicRecorder.DescribeDevices());
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -1163,7 +1739,7 @@ namespace MiiwVoice
             bool down;
             while (watcher.TryDequeue(out down))
             {
-                if (asrMode) HandleAsr(down);
+                if (settings.AsrMode) HandleAsr(down);
                 else HandleHotkey(down);
             }
 
@@ -1173,6 +1749,8 @@ namespace MiiwVoice
             {
                 recording = false;
                 watcher.SuspendRefresh = false;
+                SetIconState("busy");
+                if (settings.ShowOverlay) overlay.Busy("识别中（已到 60 秒上限）");
                 byte[] longWav = null;
                 try { longWav = recorder.Stop(); }
                 catch (Exception ex) { Log.Write("录音停止失败: " + ex.Message); }
@@ -1185,7 +1763,44 @@ namespace MiiwVoice
         private string ReadyHint()
         {
             if (recording) return "录音中…松开结束";
-            return asrMode ? "语音键已就绪：按住说话，松开出字" : "语音键已就绪：按一下开始 / 再按一下结束";
+            return settings.AsrMode ? "语音键已就绪：按住说话，松开出字" : "语音键已就绪：按一下开始 / 再按一下结束";
+        }
+
+        /// <summary>托盘图标颜色区分状态，比弹通知安静得多。</summary>
+        private void SetIconState(string state)
+        {
+            if (state == iconState) return;
+            iconState = state;
+            if (!settings.TrayColor) return;
+            switch (state)
+            {
+                case "rec":
+                    icon.Icon = TrayIcons.Get(Color.FromArgb(255, 92, 92), "rec");
+                    icon.Text = "米物语音键 · 录音中";
+                    break;
+                case "busy":
+                    icon.Icon = TrayIcons.Get(Color.FromArgb(255, 190, 70), "busy");
+                    icon.Text = "米物语音键 · 识别中";
+                    break;
+                case "err":
+                    icon.Icon = TrayIcons.Get(Color.FromArgb(215, 80, 80), "err");
+                    icon.Text = "米物语音键 · 出错";
+                    break;
+                default:
+                    icon.Icon = TrayIcons.Get(Color.FromArgb(70, 165, 255), "idle");
+                    icon.Text = "米物语音键";
+                    break;
+            }
+        }
+
+        private void OnOpenSettings(object sender, EventArgs e)
+        {
+            using (SettingsForm form = new SettingsForm(settings))
+            {
+                form.ShowDialog();
+            }
+            startupItem.Checked = IsStartupEnabled();
+            SetIconState(iconState == "" ? "idle" : iconState);
         }
 
         /// <summary>旧模式：把语音键翻译成 Win+H。</summary>
@@ -1210,16 +1825,21 @@ namespace MiiwVoice
             {
                 try
                 {
-                    recorder.Start(60, preferKeyboardMic);
+                    recorder.Start(60, settings.KeyboardMic);
                     recording = true;
                     recordStartTick = Environment.TickCount;
                     watcher.SuspendRefresh = true;
                     Log.Write("开始录音");
+                    SetIconState("rec");
+                    if (settings.ShowOverlay) overlay.Recording();
+                    Cue.On(settings.Sound, 880, 55);
                 }
                 catch (Exception ex)
                 {
                     recording = false;
                     Log.Write("录音启动失败: " + ex.Message);
+                    SetIconState("err");
+                    if (settings.ShowOverlay) overlay.Problem("录音启动失败", settings.OverlaySeconds);
                 }
                 return;
             }
@@ -1230,11 +1850,17 @@ namespace MiiwVoice
 
             byte[] wav;
             try { wav = recorder.Stop(); }
-            catch (Exception ex) { Log.Write("录音停止失败: " + ex.Message); return; }
+            catch (Exception ex)
+            {
+                Log.Write("录音停止失败: " + ex.Message);
+                SetIconState("err");
+                return;
+            }
 
             if (wav == null || wav.Length <= 44)
             {
                 Log.Write("没录到音频");
+                Skip("没录到音频");
                 return;
             }
 
@@ -1244,15 +1870,26 @@ namespace MiiwVoice
             if (milliseconds < 200)
             {
                 Log.Write("录音太短，忽略");
+                Skip("录音太短");
                 return;
             }
             if (loud < (wav.Length - 44) / 200)
             {
                 Log.Write("录音几乎全零，键盘可能处于休眠；请先按一下键盘再试");
+                Skip("键盘休眠，按一下唤醒");
                 return;
             }
 
+            SetIconState("busy");
+            if (settings.ShowOverlay) overlay.Busy("识别中");
+            Cue.On(settings.Sound, 620, 55);
             ThreadPool.QueueUserWorkItem(delegate { RecognizeAndType(wav); });
+        }
+
+        private void Skip(string reason)
+        {
+            SetIconState("idle");
+            if (settings.ShowOverlay) overlay.Problem(reason, settings.OverlaySeconds);
         }
 
         private void RecognizeAndType(byte[] wav)
@@ -1261,17 +1898,24 @@ namespace MiiwVoice
             if (text == null)
             {
                 lastText = "（识别请求失败，见日志）";
+                SetIconState("err");
+                if (settings.ShowOverlay) overlay.Problem("识别请求失败", settings.OverlaySeconds);
+                Cue.On(settings.Sound, 320, 140);
                 return;
             }
             if (text.Length == 0)
             {
                 Log.Write("识别结果为空");
                 lastText = "（没听清）";
+                SetIconState("idle");
+                if (settings.ShowOverlay) overlay.Problem("没听清", settings.OverlaySeconds);
                 return;
             }
             Log.Write("识别: " + text);
             lastText = text;
             Typer.TypeText(text);
+            SetIconState("idle");
+            if (settings.ShowOverlay) overlay.Done();
         }
 
         private static int CountLoudBytes(byte[] wav)
@@ -1368,38 +2012,38 @@ namespace MiiwVoice
         [STAThread]
         private static void Main(string[] args)
         {
-            bool keyboardMic = false;
+            AppSettings settings = AppSettings.Load();
             bool dump = false;
             bool startWithWindows = false;
-            bool asrMode = true;
-            bool systemMic = false;
-            string baseUrl = null;
-            string apiKey = null;
+            bool modeForced = false;
+            bool micForced = false;
 
             foreach (string arg in args)
             {
                 string a = arg.ToLowerInvariant();
-                if (a == "--keyboard-mic") keyboardMic = true;                // 使用键盘自带麦克风
-                else if (a == "--system-mic") systemMic = true;               // 用系统默认麦克风
+                if (a == "--keyboard-mic") { settings.KeyboardMic = true; micForced = true; }
+                else if (a == "--system-mic") { settings.KeyboardMic = false; micForced = true; }
                 else if (a == "--dump") dump = true;                          // 记录所有原始报告
                 else if (a == "--no-toggle") KeySender.StopByToggle = false;   // 松手发 Esc
                 else if (a == "--slow") KeySender.SlowCombo = true;            // 分步发送
                 else if (a == "--no-input") KeySender.Enabled = false;         // 只记日志，不注入按键
                 else if (a == "--autostart") startWithWindows = true;
-                else if (a == "--win-h") asrMode = false;                     // 退回 Win+H 模式
-                else if (a == "--asr") asrMode = true;                        // 应用内识别（默认）
-                else if (a.StartsWith("--base-url=")) baseUrl = arg.Substring(11);
-                else if (a.StartsWith("--api-key=")) apiKey = arg.Substring(10);
+                else if (a == "--win-h") { settings.AsrMode = false; modeForced = true; }
+                else if (a == "--asr") { settings.AsrMode = true; modeForced = true; }
+                else if (a.StartsWith("--base-url=")) settings.BaseUrl = arg.Substring(11);
+                else if (a.StartsWith("--api-key=")) settings.ApiKey = arg.Substring(10);
             }
 
-            MimoAsr.BaseUrl = baseUrl ?? MimoAsr.ReadSetting("MIMO_BASE_URL");
-            MimoAsr.ApiKey = apiKey ?? MimoAsr.ReadSetting("MIMO_API_KEY");
-            if (MimoAsr.BaseUrl.Length > 0) MimoAsr.BaseUrl = MimoAsr.BaseUrl.TrimEnd('/');
+            // 接口配置的优先级：命令行 -> settings.ini -> 环境变量/注册表。
+            if (settings.BaseUrl.Length == 0) settings.BaseUrl = MimoAsr.ReadSetting("MIMO_BASE_URL");
+            if (settings.ApiKey.Length == 0) settings.ApiKey = MimoAsr.ReadSetting("MIMO_API_KEY");
+            settings.BaseUrl = (settings.BaseUrl ?? "").Trim().TrimEnd('/');
+
             try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; }
             catch { }
 
-            // 应用内识别必须用键盘自带麦克风（否则语音键和麦克风对不上）且必须配置好接口。
-            if (asrMode && !systemMic) keyboardMic = true;
+            // 应用内识别必须用键盘自带麦克风（否则语音键和麦克风对不上）。
+            if (settings.AsrMode && !micForced) settings.KeyboardMic = true;
 
             bool created;
             using (Mutex mutex = new Mutex(true, @"Local\MIIWVoice.SingleInstance", out created))
@@ -1420,16 +2064,23 @@ namespace MiiwVoice
                 {
                     Log.Write("未处理异常: " + e.ExceptionObject);
                 };
-                Log.Write("==== 启动 ====" +
-                    (asrMode
-                        ? "  模式=应用内识别（mimo-v2.5-asr），麦克风=" + (keyboardMic ? "键盘自带" : "系统默认")
-                        : "  模式=Win+H 快捷键"));
-                if (asrMode && !MimoAsr.Ready)
+
+                if (settings.AsrMode && (settings.BaseUrl.Length == 0 || settings.ApiKey.Length == 0))
                 {
-                    Log.Write("未配置 MIMO_BASE_URL / MIMO_API_KEY，退回 Win+H 模式");
-                    asrMode = false;
+                    Log.Write("未配置识别接口，退回 Win+H 模式；请右键托盘 → 设置…");
+                    if (!modeForced) settings.AsrMode = false;
                 }
-                Application.Run(new TrayApp(keyboardMic, dump, startWithWindows, asrMode));
+
+                MimoAsr.BaseUrl = settings.BaseUrl;
+                MimoAsr.ApiKey = settings.ApiKey;
+
+                Log.Write("==== 启动 ====" +
+                    (settings.AsrMode
+                        ? "  模式=应用内识别（mimo-v2.5-asr），麦克风=" + (settings.KeyboardMic ? "键盘自带" : "系统默认")
+                        : "  模式=Win+H 快捷键"));
+                Log.Write("设置文件: " + AppSettings.FilePath);
+
+                Application.Run(new TrayApp(settings, dump, startWithWindows));
             }
         }
     }
