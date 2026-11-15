@@ -201,6 +201,9 @@ namespace MiiwVoice
         public const uint DigcfDeviceInterface = 0x00000010;
         public const uint GenericRead = 0x80000000;
         public const uint GenericWrite = 0x40000000;
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CancelIoEx(IntPtr file, IntPtr overlapped);
+
         public const uint FileShareRead = 0x00000001;
         public const uint FileShareWrite = 0x00000002;
         public const uint OpenExisting = 3;
@@ -378,13 +381,25 @@ namespace MiiwVoice
         private readonly bool keyboardMic;
         private readonly bool dump;
 
+        /// <summary>
+        /// 空闲时多久刷新一次语音通道。键盘断电重开后，接收器不会断开 USB，只是不再转发
+        /// 语音键报告，而 ReadFile 是阻塞的、不会返回错误。实测重发一次初始化握手即可恢复，
+        /// 所以定期刷新就够，不需要重连或拔插接收器。
+        /// </summary>
+        private const int RefreshIntervalMs = 15000;
+
         private readonly object writeGate = new object();
 
         private volatile bool stopping;
         private volatile bool connected;
+        private volatile bool buttonHeld;
+        private volatile bool suspendRefresh;
         private IntPtr device = Native.InvalidHandle;
         private System.Threading.Timer keepalive;
         private int inputReportLength = 17;
+        private int keepaliveBusy;
+        private int refreshBusy;
+        private Thread refreshThread;
 
         public HidWatcher(bool keyboardMic, bool dump)
         {
@@ -400,9 +415,62 @@ namespace MiiwVoice
             get { return connected; }
         }
 
+        /// <summary>录音期间置 true，避免定时刷新打断正在进行的按键。</summary>
+        public bool SuspendRefresh
+        {
+            get { return suspendRefresh; }
+            set { suspendRefresh = value; }
+        }
+
         public void Start()
         {
             thread.Start();
+            refreshThread = new Thread(RefreshLoop);
+            refreshThread.IsBackground = true;
+            refreshThread.Name = "MIIW refresh";
+            refreshThread.Start();
+        }
+
+        /// <summary>
+        /// 定期重发初始化握手。只重发握手而不重连，是因为实测这种方式就能把断电重开后的
+        /// 语音通道救回来，而且不会丢掉正在监听的状态。
+        /// </summary>
+        private void RefreshLoop()
+        {
+            while (!stopping)
+            {
+                int slept = 0;
+                while (!stopping && slept < RefreshIntervalMs)
+                {
+                    Thread.Sleep(250);
+                    slept += 250;
+                }
+                if (stopping) break;
+                if (!connected || buttonHeld || suspendRefresh) continue;
+
+                IntPtr handle = device;
+                if (handle == Native.InvalidHandle) continue;
+
+                if (Interlocked.CompareExchange(ref refreshBusy, 1, 0) != 0)
+                {
+                    // 上一轮刷新还没返回：写操作被卡死，链路已经不可用。打断 I/O 让读循环重连。
+                    Log.Write("语音通道刷新未返回，判定 I/O 卡死，强制重置 HID 通道");
+                    Native.CancelIoEx(handle, IntPtr.Zero);
+                    continue;
+                }
+                try
+                {
+                    InitializeVoiceChannel(handle, false);
+                }
+                catch (Exception ex)
+                {
+                    Log.Write("刷新语音通道异常: " + ex.Message);
+                }
+                finally
+                {
+                    refreshBusy = 0;
+                }
+            }
         }
 
         /// <summary>取出一个语音键事件：true = 按下，false = 松开。</summary>
@@ -452,7 +520,7 @@ namespace MiiwVoice
                 device = handle;
                 connected = true;
                 Log.Write("已打开接收器语音键通道");
-                InitializeVoiceChannel(handle);
+                InitializeVoiceChannel(handle, true);
                 StartKeepalive(handle);
                 ReadLoop(handle);
                 StopKeepalive();
@@ -477,7 +545,7 @@ namespace MiiwVoice
             // 的长度，保证每次读到的都是完整的一条，不会把夹在中间的语音键报告漏掉。
             byte[] buffer = new byte[inputReportLength];
             int read;
-            bool held = false;
+            buttonHeld = false;
             while (!stopping)
             {
                 if (!Native.ReadFile(handle, buffer, buffer.Length, out read, IntPtr.Zero)) break;
@@ -485,25 +553,32 @@ namespace MiiwVoice
                 if (dump) Log.Write("report " + Hex(buffer, read));
 
                 // 报告形如 01 B0 <state> ...：01 是 Report ID，B0 是语音键通道。
-                if (buffer[0] != 0x01 || buffer[1] != 0xB0) continue;
+                if (buffer[0] != 0x01 || buffer[1] != 0xB0)
+                {
+                    // 非语音键报告平时不写日志；不属于已知命令的记一条，便于发现
+                    // 接收器的链路事件（实测断连重开时出现过未文档化的 01 e3 05 ...）。
+                    if (!dump && !IsKnownReport(buffer[1]))
+                        Log.Write("未知报告 0x" + buffer[1].ToString("X2") + "  " + Hex(buffer, read));
+                    continue;
+                }
 
                 byte state = buffer[2];
                 if (state != 0)
                 {
-                    if (held) continue;            // B0 03 是按住时的重复帧
-                    held = true;
+                    if (buttonHeld) continue;      // B0 03 是按住时的重复帧
+                    buttonHeld = true;
                     Log.Write("语音键按下 (state=" + state + ")");
                     if (keyboardMic)
                     {
                         SetKeyboardMic(true);
-                        // 等开麦爆音过去再触发听写，否则识别器开头就是一段撞满量程的噪声。
+                        // 等开麦爆音过去再开始录音，否则开头就是一段撞满量程的噪声。
                         Thread.Sleep(MicWarmupMs);
                     }
                     Enqueue(true);
                 }
-                else if (held)
+                else if (buttonHeld)
                 {
-                    held = false;
+                    buttonHeld = false;
                     Log.Write("语音键松开");
                     Enqueue(false);
                     if (keyboardMic)
@@ -513,6 +588,13 @@ namespace MiiwVoice
                     }
                 }
             }
+            buttonHeld = false;
+        }
+
+        private static bool IsKnownReport(byte command)
+        {
+            return command == 0xB0 || command == 0xB1 || command == 0xB2 ||
+                   command == 0xD1 || command == 0xE1 || command == 0xE2;
         }
 
         /// <summary>
@@ -538,15 +620,16 @@ namespace MiiwVoice
                 ok = Native.WriteFile(handle, buffer, buffer.Length, out written, IntPtr.Zero)
                      && written == buffer.Length;
             }
-            if (!ok) Log.Write(label + " 失败，错误码 " + Marshal.GetLastWin32Error() + "，已写入 " + written);
-            else if (dump) Log.Write(label + " 已发送");
+            if (!ok) Log.Write((label ?? "命令") + " 失败，错误码 " + Marshal.GetLastWin32Error() + "，已写入 " + written);
+            else if (dump && label != null) Log.Write(label + " 已发送");
         }
 
         /// <summary>
         /// 初始化语音通道：E1/D1/E2/B1 各两轮，时序取自搜狗助手抓包。
         /// 缺了这一步接收器不会给无线麦克风通电，只发 B2 01 会是完全静音的。
+        /// verbose 为 false 时不写成功日志（供定时刷新使用，避免日志刷屏）。
         /// </summary>
-        private void InitializeVoiceChannel(IntPtr handle)
+        private void InitializeVoiceChannel(IntPtr handle, bool verbose)
         {
             byte[][] sequence =
             {
@@ -563,19 +646,34 @@ namespace MiiwVoice
 
             for (int i = 0; i < sequence.Length && !stopping; i++)
             {
-                WriteCommand(handle, sequence[i][0], sequence[i][1], sequence[i][2], "初始化");
+                WriteCommand(handle, sequence[i][0], sequence[i][1], sequence[i][2],
+                    verbose ? "初始化" : null);
                 Thread.Sleep(delays[i]);
             }
-            Log.Write("语音通道初始化完成");
+            if (verbose) Log.Write("语音通道初始化完成");
         }
 
         /// <summary>助手在初始化后每 6 秒发一次 E2，作为无线链路的保活。</summary>
         private void StartKeepalive(IntPtr handle)
         {
             StopKeepalive();
-            keepalive = new System.Threading.Timer(
-                delegate { WriteCommand(device, 0xE2, 0x00, 0xF5, "保活"); },
-                null, 6000, 6000);
+            keepaliveBusy = 0;
+            keepalive = new System.Threading.Timer(delegate { OnKeepalive(); }, null, 6000, 6000);
+        }
+
+        private void OnKeepalive()
+        {
+            // 无线链路卡住时 WriteFile 会阻塞很久。如果上一次保活还没返回就跳过本次，
+            // 否则回调会在 writeGate 上无上限排队，链路恢复后一起涌出来（实测 133 次聚集在 0.1 秒内）。
+            if (Interlocked.CompareExchange(ref keepaliveBusy, 1, 0) != 0) return;
+            try
+            {
+                WriteCommand(device, 0xE2, 0x00, 0xF5, "保活");
+            }
+            finally
+            {
+                keepaliveBusy = 0;
+            }
         }
 
         private void StopKeepalive()
@@ -1009,6 +1107,7 @@ namespace MiiwVoice
         private readonly bool preferKeyboardMic;
         private bool dictationOn;
         private bool recording;
+        private int recordStartTick;
         private volatile string lastText;
 
         public TrayApp(bool keyboardMic, bool dump, bool startWithWindows, bool asrMode)
@@ -1067,6 +1166,20 @@ namespace MiiwVoice
                 if (asrMode) HandleAsr(down);
                 else HandleHotkey(down);
             }
+
+            // 键盘在按住期间被关掉时收不到松开报告。录音到达缓冲区上限（60 秒）就自动收尾，
+            // 不丢弃 —— 一段很长的口述同样可能是用户真想说的。
+            if (recording && unchecked(Environment.TickCount - recordStartTick) >= 60000)
+            {
+                recording = false;
+                watcher.SuspendRefresh = false;
+                byte[] longWav = null;
+                try { longWav = recorder.Stop(); }
+                catch (Exception ex) { Log.Write("录音停止失败: " + ex.Message); }
+                Log.Write("录音到达 60 秒上限，自动收尾上传");
+                if (longWav != null && longWav.Length > 44)
+                    ThreadPool.QueueUserWorkItem(delegate { RecognizeAndType(longWav); });
+            }
         }
 
         private string ReadyHint()
@@ -1099,6 +1212,8 @@ namespace MiiwVoice
                 {
                     recorder.Start(60, preferKeyboardMic);
                     recording = true;
+                    recordStartTick = Environment.TickCount;
+                    watcher.SuspendRefresh = true;
                     Log.Write("开始录音");
                 }
                 catch (Exception ex)
@@ -1111,6 +1226,7 @@ namespace MiiwVoice
 
             if (!recording) return;
             recording = false;
+            watcher.SuspendRefresh = false;
 
             byte[] wav;
             try { wav = recorder.Stop(); }
