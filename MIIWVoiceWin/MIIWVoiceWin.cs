@@ -167,9 +167,6 @@ namespace MiiwVoice
         [DllImport("hid.dll", SetLastError = true)]
         public static extern bool HidD_SetNumInputBuffers(IntPtr device, int buffers);
 
-        [DllImport("hid.dll", SetLastError = true)]
-        public static extern bool HidD_SetOutputReport(IntPtr device, byte[] buffer, int length);
-
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, IntPtr enumerator, IntPtr parent, uint flags);
 
@@ -190,6 +187,9 @@ namespace MiiwVoice
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool ReadFile(IntPtr file, byte[] buffer, int count, out int read, IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool WriteFile(IntPtr file, byte[] buffer, int count, out int written, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr handle);
@@ -290,15 +290,26 @@ namespace MiiwVoice
         private const ushort VendorUsagePage = 0xFF00;
         private const ushort VendorUsage = 0x0001;
 
+        /// <summary>
+        /// 发送 B2 01 后等多久才触发听写。接收器每次开麦都会产生一个直流冲击：
+        /// 采样值从 0 指数型冲到 int16 下限并持续修约 300~400ms，这段音频完全不可用。
+        /// 太早触发听写会让识别器一开始就吃到爆音。
+        /// </summary>
+        private const int MicWarmupMs = 450;
+
         private readonly Thread thread;
         private readonly object queueGate = new object();
         private readonly Queue<bool> pending = new Queue<bool>();
         private readonly bool keyboardMic;
         private readonly bool dump;
 
+        private readonly object writeGate = new object();
+
         private volatile bool stopping;
         private volatile bool connected;
         private IntPtr device = Native.InvalidHandle;
+        private System.Threading.Timer keepalive;
+        private int inputReportLength = 17;
 
         public HidWatcher(bool keyboardMic, bool dump)
         {
@@ -337,6 +348,7 @@ namespace MiiwVoice
         public void Dispose()
         {
             stopping = true;
+            StopKeepalive();
             IntPtr handle = device;
             device = Native.InvalidHandle;
             if (handle != Native.InvalidHandle) Native.CloseHandle(handle);
@@ -365,7 +377,10 @@ namespace MiiwVoice
                 device = handle;
                 connected = true;
                 Log.Write("已打开接收器语音键通道");
+                InitializeVoiceChannel(handle);
+                StartKeepalive(handle);
                 ReadLoop(handle);
+                StopKeepalive();
                 connected = false;
 
                 if (device == handle)
@@ -383,13 +398,15 @@ namespace MiiwVoice
 
         private void ReadLoop(IntPtr handle)
         {
-            byte[] buffer = new byte[64];
+            // ReadFile 一次可能返回多条报告拼在一起（实测三条合法），所以缓冲区正好取一条报告
+            // 的长度，保证每次读到的都是完整的一条，不会把夹在中间的语音键报告漏掉。
+            byte[] buffer = new byte[inputReportLength];
             int read;
             bool held = false;
             while (!stopping)
             {
                 if (!Native.ReadFile(handle, buffer, buffer.Length, out read, IntPtr.Zero)) break;
-                if (read < 3) continue;
+                if (read < inputReportLength) continue;
                 if (dump) Log.Write("report " + Hex(buffer, read));
 
                 // 报告形如 01 B0 <state> ...：01 是 Report ID，B0 是语音键通道。
@@ -401,7 +418,12 @@ namespace MiiwVoice
                     if (held) continue;            // B0 03 是按住时的重复帧
                     held = true;
                     Log.Write("语音键按下 (state=" + state + ")");
-                    if (keyboardMic) SetKeyboardMic(true);
+                    if (keyboardMic)
+                    {
+                        SetKeyboardMic(true);
+                        // 等开麦爆音过去再触发听写，否则识别器开头就是一段撞满量程的噪声。
+                        Thread.Sleep(MicWarmupMs);
+                    }
                     Enqueue(true);
                 }
                 else if (held)
@@ -409,40 +431,93 @@ namespace MiiwVoice
                     held = false;
                     Log.Write("语音键松开");
                     Enqueue(false);
-                    if (keyboardMic) SetKeyboardMic(false);
+                    if (keyboardMic)
+                    {
+                        Thread.Sleep(MicWarmupMs);
+                        SetKeyboardMic(false);
+                    }
                 }
             }
+        }
+
+        /// <summary>
+        /// 向 MI_05 厂商通道写一条命令。报文体固定 128 字节：Report ID 02 + 14 字节数据 + 校验，
+        /// 其余零填充。校验值是抓包得到的固定常量，只用于写入。
+        /// </summary>
+        private void WriteCommand(IntPtr handle, byte command, byte value, byte checksum, string label)
+        {
+            if (handle == Native.InvalidHandle) return;
+
+            byte[] buffer = new byte[128];
+            buffer[0] = 0x02;
+            buffer[1] = command;
+            buffer[2] = value;
+            buffer[127] = checksum;
+
+            // 必须用 WriteFile（IOCTL_HID_WRITE_REPORT）。HidD_SetOutputReport 对这个接收器
+            // 会返回 TRUE 但实际一条报告也不发，导致初始化握手和 B2 开关全部静默失效。
+            bool ok;
+            int written = 0;
+            lock (writeGate)
+            {
+                ok = Native.WriteFile(handle, buffer, buffer.Length, out written, IntPtr.Zero)
+                     && written == buffer.Length;
+            }
+            if (!ok) Log.Write(label + " 失败，错误码 " + Marshal.GetLastWin32Error() + "，已写入 " + written);
+            else if (dump) Log.Write(label + " 已发送");
+        }
+
+        /// <summary>
+        /// 初始化语音通道：E1/D1/E2/B1 各两轮，时序取自搜狗助手抓包。
+        /// 缺了这一步接收器不会给无线麦克风通电，只发 B2 01 会是完全静音的。
+        /// </summary>
+        private void InitializeVoiceChannel(IntPtr handle)
+        {
+            byte[][] sequence =
+            {
+                new byte[] { 0xE1, 0x00, 0xF3 }, // 查固件
+                new byte[] { 0xD1, 0x00, 0x93 }, // 查设备身份
+                new byte[] { 0xE2, 0x00, 0xF5 }, // 保活
+                new byte[] { 0xB1, 0x00, 0x53 }, // 初始化语音通道
+                new byte[] { 0xE1, 0x00, 0xF3 },
+                new byte[] { 0xD1, 0x00, 0x93 },
+                new byte[] { 0xE2, 0x00, 0xF5 },
+                new byte[] { 0xB1, 0x00, 0x53 },
+            };
+            int[] delays = { 500, 480, 20, 20, 480, 480, 20, 20 };
+
+            for (int i = 0; i < sequence.Length && !stopping; i++)
+            {
+                WriteCommand(handle, sequence[i][0], sequence[i][1], sequence[i][2], "初始化");
+                Thread.Sleep(delays[i]);
+            }
+            Log.Write("语音通道初始化完成");
+        }
+
+        /// <summary>助手在初始化后每 6 秒发一次 E2，作为无线链路的保活。</summary>
+        private void StartKeepalive(IntPtr handle)
+        {
+            StopKeepalive();
+            keepalive = new System.Threading.Timer(
+                delegate { WriteCommand(device, 0xE2, 0x00, 0xF5, "保活"); },
+                null, 6000, 6000);
+        }
+
+        private void StopKeepalive()
+        {
+            System.Threading.Timer timer = keepalive;
+            keepalive = null;
+            if (timer != null) timer.Dispose();
         }
 
         /// <summary>米物麦克风模式：按下时让接收器打开键盘麦克风，松手关闭。</summary>
         private void SetKeyboardMic(bool open)
         {
-            IntPtr handle = device;
-            if (handle == Native.InvalidHandle) return;
-
-            Native.HidpCaps caps = new Native.HidpCaps();
-            IntPtr preparsed;
-            if (!Native.HidD_GetPreparsedData(handle, out preparsed)) return;
-            try
-            {
-                if (Native.HidP_GetCaps(preparsed, ref caps) < 0) return;
-            }
-            finally
-            {
-                Native.HidD_FreePreparsedData(preparsed);
-            }
-
-            // 与 macOS 版一致：Report ID 2，B2 01/00，128 字节报文体，末字节校验（只用于写入）。
-            byte[] buffer = new byte[128];
-            buffer[0] = 0x02;
-            buffer[1] = 0xB2;
-            buffer[2] = (byte)(open ? 1 : 0);
-            buffer[127] = (byte)(open ? 0x3D : 0x55);
-            bool ok = Native.HidD_SetOutputReport(handle, buffer, buffer.Length);
-            Log.Write("麦克风 " + (open ? "开" : "关") + " -> " + (ok ? "成功" : "失败 " + Marshal.GetLastWin32Error()));
+            WriteCommand(device, 0xB2, (byte)(open ? 1 : 0), (byte)(open ? 0x3D : 0x55),
+                "麦克风 " + (open ? "开" : "关"));
         }
 
-        private static IntPtr OpenVendorCollection()
+        private IntPtr OpenVendorCollection()
         {
             Guid hidGuid;
             Native.HidD_GetHidGuid(out hidGuid);
@@ -470,6 +545,8 @@ namespace MiiwVoice
                     if (IsVendorCollection(handle))
                     {
                         Native.HidD_SetNumInputBuffers(handle, 64);
+                        int length = GetInputReportLength(handle);
+                        if (length > 0 && length <= 512) inputReportLength = length;
                         return handle;
                     }
                     Native.CloseHandle(handle);
@@ -518,6 +595,22 @@ namespace MiiwVoice
                 Native.HidpCaps caps = new Native.HidpCaps();
                 if (Native.HidP_GetCaps(preparsed, ref caps) < 0) return false;
                 return caps.UsagePage == VendorUsagePage && caps.Usage == VendorUsage;
+            }
+            finally
+            {
+                Native.HidD_FreePreparsedData(preparsed);
+            }
+        }
+
+        private static int GetInputReportLength(IntPtr handle)
+        {
+            IntPtr preparsed;
+            if (!Native.HidD_GetPreparsedData(handle, out preparsed)) return 0;
+            try
+            {
+                Native.HidpCaps caps = new Native.HidpCaps();
+                if (Native.HidP_GetCaps(preparsed, ref caps) < 0) return 0;
+                return caps.InputReportByteLength;
             }
             finally
             {
