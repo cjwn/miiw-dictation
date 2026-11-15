@@ -506,7 +506,16 @@ namespace MiiwVoice
             StopKeepalive();
             IntPtr handle = device;
             device = Native.InvalidHandle;
-            if (handle != Native.InvalidHandle) Native.CloseHandle(handle);
+            if (handle != Native.InvalidHandle)
+            {
+                // 读循环此刻多半正阻塞在 ReadFile 上。直接 CloseHandle 会一直等到
+                // 那个未完成的同步 I/O 被取消为止（实测能把退出拖住好几秒），
+                // 所以先用 CancelIoEx 把它打断。
+                try { Native.CancelIoEx(handle, IntPtr.Zero); }
+                catch { }
+                try { Native.CloseHandle(handle); }
+                catch { }
+            }
         }
 
         private void Enqueue(bool down)
@@ -1686,6 +1695,7 @@ namespace MiiwVoice
         private volatile string lastText;
         private string iconState = "";
         private volatile int powerEvent;
+        private bool shuttingDown;
 
         public TrayApp(AppSettings settings, bool dump, bool startWithWindows)
         {
@@ -1998,21 +2008,53 @@ namespace MiiwVoice
 
         private void OnExit(object sender, EventArgs e)
         {
+            Shutdown();
             ExitThread();
+        }
+
+        /// <summary>
+        /// 退出前主动收拾干净。ApplicationContext.ExitThread() 不会调用 Dispose，
+        /// 所以如果只调 ExitThread()，托盘图标不会被移除 —— 它会留在通知区里
+        /// 等 Shell 自己回收，看起来就是“点了退出还要等一会儿才消失”。
+        /// </summary>
+        private void Shutdown()
+        {
+            if (shuttingDown) return;
+            shuttingDown = true;
+
+            Log.Write("退出");
+
+            // 第一步必须是移除托盘图标 —— 这是用户判断“退出了没有”的唯一依据，
+            // 不能让后面任何清理拖慢它。
+            try { icon.Visible = false; icon.Dispose(); }
+            catch { }
+            try { overlay.Dispose(); }
+            catch { }
+            try { timer.Stop(); timer.Dispose(); }
+            catch { }
+
+            if (recording)
+            {
+                recording = false;
+                watcher.SuspendRefresh = false;
+                try { recorder.Stop(); }
+                catch { }
+            }
+
+            // 这两步可能阻塞（SystemEvents 的注销、关闭带未完成 I/O 的 HID 句柄），
+            // 放到后台线程做，不挡 UI 线程。进程随后就会被 Environment.Exit 结束。
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged; }
+                catch { }
+                try { watcher.Dispose(); }
+                catch { }
+            });
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
-            {
-                try { Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged; }
-                catch { }
-                timer.Stop();
-                timer.Dispose();
-                watcher.Dispose();
-                icon.Visible = false;
-                icon.Dispose();
-            }
+            if (disposing) Shutdown();
             base.Dispose(disposing);
         }
 
@@ -2143,6 +2185,14 @@ namespace MiiwVoice
 
                 Application.Run(new TrayApp(settings, dump, startWithWindows));
             }
+
+            // 给 Shell 一点点时间处理 NIM_DELETE。否则进程瞬间消失时，
+            // 通知区有时会留下一个“幽灵”图标，要等鼠标划过才刷新掉。
+            Thread.Sleep(150);
+
+            // 兜底：立刻结束进程。托盘图标的 Shell 回收、后台线程、未完成的 HTTP 请求
+            // 都不应该让进程在“已经退出”之后还挂在任务管理器里。
+            Environment.Exit(0);
         }
     }
 }
