@@ -109,7 +109,4 @@ MIIW Voice.exe --base-url=https://xxx/v1 --api-key=tp-xxx
 | 出字 | 听写或粘贴 | `SendInput` + `KEYEVENTF_UNICODE` |
 | 界面 | 菜单栏 `NSStatusItem` | 托盘 `NotifyIcon` |
 
-## 卸载搜狗
 
-本程序与搜狗无关。确认能用之后，可以放心卸载搜狗输入法的智能助手组件；键盘本身是标准 HID
-键盘 + USB Audio，不依赖任何厂商驱动。
